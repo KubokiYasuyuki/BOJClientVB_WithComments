@@ -1,6 +1,5 @@
 Imports System.Net.Sockets
 Imports System.Text
-Imports System.Security.Cryptography
 Imports Microsoft.Win32
 
 '***********************************************************************
@@ -151,7 +150,12 @@ Public Class BOJClientVBCLS
     '*      szDBID      String      DBユーザID
     '*      szDBPWD     String      DBパスワード
     '*      szON        String      オンラインフラグ
-    '*      szRESULT    String      処理ステータス(0:正常, 1～5:エラー発生位置)
+    '*      szRESULT    String      処理ステータス
+    '*                                0:正常
+    '*                                1:レジストリエラー
+    '*                                2:コネクションエラー
+    '*                                3:その他のエラー(szERRにエラー内容)
+    '*                                4:受信タイムアウト
     '*      szERR       String      エラーメッセージ
     '*  [ret]
     '*      Integer     常に 0 を返す（処理結果は szRESULT で判定）
@@ -198,7 +202,6 @@ Public Class BOJClientVBCLS
         '--------------------------------------------------
         'サービスポート番号取得
         '--------------------------------------------------
-        lStat = 2
         'services ファイルからサービス名に対応するポート番号を取得
         Dim port As Integer = GetServicePort(m_service)
         If port <= 0 Then
@@ -209,6 +212,7 @@ Public Class BOJClientVBCLS
         '--------------------------------------------------
         'サーバ接続（host1 → 失敗時 host2 フェイルオーバ）
         '--------------------------------------------------
+        lStat = 2                       'コネクションエラー用ステータス
         Dim client As TcpClient = Nothing
         Dim nHost As Integer = 1    '接続成功したホスト番号（1:host1, 2:host2）
 
@@ -248,9 +252,8 @@ Public Class BOJClientVBCLS
         lStat = 3
         Try
             Dim stream As NetworkStream = client.GetStream()
-            'VIDRコマンド文字列生成
-            'Dim command As String = BuildCmdVIDR(sID, sPWD)        '2026/04/16
-            Dim command As String = BuildCmdVIDR("DUMMY", "DUMMY")  '2026/04/16
+            'VIDRコマンド文字列生成（設計書仕様によりダミー文字列"DUMMY"固定）
+            Dim command As String = BuildCmdVIDR("DUMMY", "DUMMY")
             '送信用バイト列へ変換（ASCIIエンコード）
             Dim sendData As Byte() = Encoding.ASCII.GetBytes(command)
             'サーバへ送信
@@ -265,7 +268,7 @@ Public Class BOJClientVBCLS
         '--------------------------------------------------
         '応答受信（タイムアウト付きポーリング）
         '--------------------------------------------------
-        lStat = 4
+        lStat = 4                       '受信タイムアウト用ステータス（例外発生時は 3 に切替）
         Dim response As String = ""     'サーバ応答文字列
         Try
             Dim stream As NetworkStream = client.GetStream()
@@ -297,7 +300,8 @@ Public Class BOJClientVBCLS
                 GoTo lblerr
             End If
         Catch ex As Exception
-            '受信失敗時は処理中断
+            '受信中の例外はタイムアウトではなく「その他のエラー」として扱う
+            lStat = 3
             sErr = "Receive error: " & ex.Message
             client.Close()
             GoTo lblerr
@@ -306,7 +310,7 @@ Public Class BOJClientVBCLS
         '--------------------------------------------------
         '応答解析
         '--------------------------------------------------
-        lStat = 5
+        lStat = 3                       '解析エラーは「その他のエラー」として扱う
         'ソケットクローズ
         client.Close()
 
@@ -466,161 +470,5 @@ lblerr:
         'サービス名未登録
         Return -1
     End Function
-
-#Region "DES Encryption (for future use)"
-
-    'DES暗号化用固定鍵（8バイト）
-    Private Shared ReadOnly DesKey As Byte() = New Byte() {&HA0, &H10, &H82, &HEC, &H61, &H19, &H29, &H03}
-
-    '***********************************************************************
-    '* DESEncryptPassword
-    '*  [概要]
-    '*      指定された文字列を DES(ECB/NoPadding) で暗号化する。
-    '*      入力長が 8 の倍数でない場合はゼロパディングして 8 バイト境界に揃える。
-    '*  [in]
-    '*      password    String      暗号化対象の平文パスワード
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      Byte()      暗号化後のバイト列
-    '*  [備考]
-    '*      将来機能用。現状 AAVerifyID からは未使用。
-    '***********************************************************************
-    Private Function DESEncryptPassword(password As String) As Byte()
-        '入力文字列をASCIIバイト列化
-        Dim inputBytes As Byte() = Encoding.ASCII.GetBytes(password)
-        '8バイト境界へ切り上げた長さを算出
-        Dim paddedLength As Integer = ((inputBytes.Length + 7) \ 8) * 8
-        'ゼロパディング済みバッファ
-        Dim paddedInput(paddedLength - 1) As Byte
-        Array.Copy(inputBytes, paddedInput, inputBytes.Length)
-
-        'DES暗号化実行
-        Using des As DESCryptoServiceProvider = New DESCryptoServiceProvider()
-            des.Key = DesKey
-            des.Mode = CipherMode.ECB
-            des.Padding = PaddingMode.None
-
-            Using encryptor As ICryptoTransform = des.CreateEncryptor()
-                Return encryptor.TransformFinalBlock(paddedInput, 0, paddedInput.Length)
-            End Using
-        End Using
-    End Function
-
-    '***********************************************************************
-    '* DESDecryptPassword
-    '*  [概要]
-    '*      DES(ECB/NoPadding)で暗号化されたバイト列を平文文字列へ復号する。
-    '*      復号結果の末尾にNULL(0x00)が含まれる場合はそこで文字列を打ち切る。
-    '*  [in]
-    '*      encryptedData   Byte()      暗号化済みバイト列
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      String          復号後の平文文字列
-    '*  [備考]
-    '*      将来機能用。現状 AAVerifyID からは未使用。
-    '***********************************************************************
-    Private Function DESDecryptPassword(encryptedData As Byte()) As String
-        'DES復号実行
-        Using des As DESCryptoServiceProvider = New DESCryptoServiceProvider()
-            des.Key = DesKey
-            des.Mode = CipherMode.ECB
-            des.Padding = PaddingMode.None
-
-            Using decryptor As ICryptoTransform = des.CreateDecryptor()
-                Dim decrypted As Byte() = decryptor.TransformFinalBlock(encryptedData, 0, encryptedData.Length)
-                '復号結果の末尾NULLを検索
-                Dim nullIndex As Integer = Array.IndexOf(decrypted, CByte(0))
-                If nullIndex >= 0 Then
-                    'NULLまでを文字列化
-                    Return Encoding.ASCII.GetString(decrypted, 0, nullIndex)
-                Else
-                    '全バイトを文字列化
-                    Return Encoding.ASCII.GetString(decrypted)
-                End If
-            End Using
-        End Using
-    End Function
-
-#End Region
-
-#Region "Base64 Encoding (for future use)"
-
-    '***********************************************************************
-    '* Base64Encode
-    '*  [概要]
-    '*      バイト列を Base64 文字列へエンコードする。
-    '*  [in]
-    '*      data    Byte()      エンコード対象バイト列
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      String  Base64 エンコード結果
-    '*  [備考]
-    '*      将来機能用。
-    '***********************************************************************
-    Private Function Base64Encode(data As Byte()) As String
-        Return Convert.ToBase64String(data)
-    End Function
-
-    '***********************************************************************
-    '* Base64Decode
-    '*  [概要]
-    '*      Base64 文字列をバイト列へデコードする。
-    '*  [in]
-    '*      base64String    String      Base64 エンコード済み文字列
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      Byte()  デコード結果バイト列
-    '*  [備考]
-    '*      将来機能用。
-    '***********************************************************************
-    Private Function Base64Decode(base64String As String) As Byte()
-        Return Convert.FromBase64String(base64String)
-    End Function
-
-    '***********************************************************************
-    '* EncryptAndEncodePassword
-    '*  [概要]
-    '*      平文パスワードを DES 暗号化したのち Base64 エンコードして返す。
-    '*  [in]
-    '*      password    String      平文パスワード
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      String      DES暗号化+Base64エンコード済み文字列
-    '*  [備考]
-    '*      将来機能用。
-    '***********************************************************************
-    Private Function EncryptAndEncodePassword(password As String) As String
-        'DES暗号化
-        Dim encrypted As Byte() = DESEncryptPassword(password)
-        'Base64エンコード
-        Return Base64Encode(encrypted)
-    End Function
-
-    '***********************************************************************
-    '* DecodeAndDecryptPassword
-    '*  [概要]
-    '*      Base64 文字列を DES 復号し、平文パスワードへ戻す。
-    '*  [in]
-    '*      encodedPassword     String      DES暗号化+Base64エンコード済み文字列
-    '*  [out]
-    '*      なし
-    '*  [ret]
-    '*      String      復号後の平文パスワード
-    '*  [備考]
-    '*      将来機能用。
-    '***********************************************************************
-    Private Function DecodeAndDecryptPassword(encodedPassword As String) As String
-        'Base64デコード
-        Dim encrypted As Byte() = Base64Decode(encodedPassword)
-        'DES復号
-        Return DESDecryptPassword(encrypted)
-    End Function
-
-#End Region
 
 End Class
